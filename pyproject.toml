@@ -1,0 +1,9 @@
+[project]
+name = "auditable-expense-agent"
+version = "0.1.0"
+description = "Auditable expense-approval agent: LangGraph + deterministic guardrails + policy RAG + HITL + eval harness"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

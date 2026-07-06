@@ -53,6 +53,10 @@ def percentile(values: list[float], p: float) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--pace", type=float, default=float(os.getenv("EVAL_PACE_S", "0")),
+        help="Seconds to sleep between cases (stay under free-tier RPM limits).",
+    )
     args = parser.parse_args()
 
     cases = [
@@ -97,6 +101,8 @@ def main() -> None:
         mark = "[green]OK[/green]" if ok else "[red]MISS[/red]"
         console.print(f"  {i:>2}/{len(cases)} {case['case_id']} -> {out:<9} "
                       f"(expected {case['expected']}) {mark}")
+        if args.pace and i < len(cases):
+            time.sleep(args.pace)
 
     # --- aggregate ---
     n = len(rows)
