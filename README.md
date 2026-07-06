@@ -66,11 +66,13 @@ The model *attempted* two over-limit approvals and one ungrounded justification 
 overridden by the deterministic layer. Zero unauthorized approvals is a property of the architecture, not of the
 model's good behavior.
 
-An earlier run also surfaced a real reliability lesson: `gemini-2.5-flash`'s dynamic thinking mode occasionally
+Two earlier runs surfaced real reliability lessons. First, `gemini-2.5-flash`'s dynamic thinking mode occasionally
 looped for 60k+ tokens on a 100-token task (8-minute latency, 200x cost) until the JSON never completed — the run
 failed closed to human review exactly as designed, and the fix was bounding `thinking_budget` and
-`max_output_tokens`. A comparison run on `gemini-2.5-flash-lite` was safe but over-conservative (escalated ~30% of
-auto-approvable requests), which is why the mid-tier model was chosen.
+`max_output_tokens`. Second, a baseline run on a rate-limited free-tier key turned into an unplanned chaos test:
+the LLM was unavailable for 31 of 50 decisions, and the system degraded safely — zero unauthorized approvals,
+100% escalation recall, every failed decision routed to human review, and pre-guardrails still settling
+blacklist/receipt cases at zero cost. Availability failures never became wrong approvals.
 
 ## Quickstart
 
