@@ -5,6 +5,7 @@ retrieval contract (clause IDs + scores in the audit trail) is what matters."""
 import hashlib
 import json
 import re
+import time
 
 import numpy as np
 from google import genai
@@ -39,8 +40,19 @@ def load_clauses() -> list[dict]:
 
 
 def _embed(texts: list[str]) -> np.ndarray:
-    resp = client().models.embed_content(model=config.EMBED_MODEL, contents=texts)
-    return np.array([e.values for e in resp.embeddings], dtype=np.float32)
+    """Embed with bounded retry — 429/5xx are transient capacity, not answers."""
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = client().models.embed_content(model=config.EMBED_MODEL, contents=texts)
+            return np.array([e.values for e in resp.embeddings], dtype=np.float32)
+        except Exception as exc:
+            last_exc = exc
+            transient = any(code in str(exc) for code in ("429", "500", "503", "504"))
+            if not transient or attempt == 2:
+                raise
+            time.sleep(2 ** attempt * 5)
+    raise last_exc  # unreachable, keeps type-checkers happy
 
 
 def _clause_embeddings(clauses: list[dict]) -> np.ndarray:

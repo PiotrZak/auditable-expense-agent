@@ -93,9 +93,25 @@ def pre_guardrails(state: AgentState) -> dict:
 
 def retrieve_policy(state: AgentState) -> dict:
     t0 = time.perf_counter()
-    clauses = retrieval.retrieve(_request(state))
+    try:
+        clauses = retrieval.retrieve(_request(state))
+        if clauses:
+            return {
+                "retrieved_clauses": clauses,
+                "telemetry": _node_timing(state, "retrieve_policy", t0),
+            }
+        detail = "Retrieval returned no policy clauses."
+    except Exception as exc:
+        detail = f"Policy retrieval failed after retries: {type(exc).__name__}."
+    # fail closed: without grounding there is no basis for an automated decision
     return {
-        "retrieved_clauses": clauses,
+        "final_decision": "escalate",
+        "decided_by": "system:retrieval_failure",
+        "pending_reason": detail + " Routed to manual review (no grounded decision possible).",
+        "guardrail_events": (state.get("guardrail_events") or []) + [{
+            "rule_id": "GR-RETRIEVAL-FAILCLOSED", "stage": "pre",
+            "action": "escalate", "detail": detail,
+        }],
         "telemetry": _node_timing(state, "retrieve_policy", t0),
     }
 
@@ -193,6 +209,10 @@ def route_after_pre(state: AgentState) -> str:
     return "retrieve_policy"
 
 
+def route_after_retrieve(state: AgentState) -> str:
+    return "hitl" if state.get("final_decision") == "escalate" else "reason"
+
+
 def route_after_post(state: AgentState) -> str:
     return "hitl" if state.get("final_decision") == "escalate" else "finalize"
 
@@ -217,7 +237,8 @@ def get_graph():
                                       ["pre_guardrails", "finalize"])
         builder.add_conditional_edges("pre_guardrails", route_after_pre,
                                       ["retrieve_policy", "hitl", "finalize"])
-        builder.add_edge("retrieve_policy", "reason")
+        builder.add_conditional_edges("retrieve_policy", route_after_retrieve,
+                                      ["reason", "hitl"])
         builder.add_edge("reason", "post_guardrails")
         builder.add_conditional_edges("post_guardrails", route_after_post,
                                       ["hitl", "finalize"])
