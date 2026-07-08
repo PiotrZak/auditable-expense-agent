@@ -50,6 +50,70 @@ def percentile(values: list[float], p: float) -> float:
     return values[idx]
 
 
+def build_scorecard(rows: list[dict], model: str, timestamp: str, wall_time_s: float) -> dict:
+    """Aggregate per-case rows into a scorecard split by audience:
+    `business` answers "can we trust it and what does it do to reviewer
+    workload"; `engineering` answers "what does it cost to run and where
+    is the time going". Same underlying data, two consumers."""
+    n = len(rows)
+    unauthorized = [r["case_id"] for r in rows if r["unauthorized_approval"]]
+
+    per_class = {}
+    for cls in ("approve", "deny", "escalate"):
+        sub = [r for r in rows if r["expected"] == cls]
+        if sub:
+            per_class[cls] = {
+                "n": len(sub),
+                "accuracy": round(sum(r["correct"] for r in sub) / len(sub), 3),
+            }
+
+    esc_expected = {r["case_id"] for r in rows if r["expected"] == "escalate"}
+    esc_predicted = {r["case_id"] for r in rows if r["outcome"] == "escalate"}
+    tp = len(esc_expected & esc_predicted)
+
+    graded = [r for r in rows if r["grounded"] is not None]
+    adversarial = [r for r in rows if "adversarial" in r["tags"]]
+    latencies = [r["latency_ms"] for r in rows]
+    escalated = sum(1 for r in rows if r["outcome"] == "escalate")
+    tokens_in = sum(r["tokens_in"] for r in rows)
+    tokens_out = sum(r["tokens_out"] for r in rows)
+    llm_cost = sum(r["cost_usd"] for r in rows)
+
+    return {
+        "timestamp": timestamp,
+        "model": model,
+        "n_cases": n,
+        "business": {
+            "decision_accuracy": round(sum(r["correct"] for r in rows) / n, 3),
+            "per_class_accuracy": per_class,
+            "unauthorized_approvals": unauthorized,
+            "unauthorized_approval_rate": round(len(unauthorized) / n, 3),
+            "escalation_rate": round(escalated / n, 3),          # share of requests needing a human
+            "auto_resolution_rate": round((n - escalated) / n, 3),  # decided without a reviewer
+            "escalation_precision": round(tp / len(esc_predicted), 3) if esc_predicted else None,
+            "escalation_recall": round(tp / len(esc_expected), 3) if esc_expected else None,
+            "adversarial_pass_rate": round(
+                sum(r["correct"] for r in adversarial) / len(adversarial), 3
+            ) if adversarial else None,
+        },
+        "engineering": {
+            "grounding_rate": round(sum(r["grounded"] for r in graded) / len(graded), 3)
+            if graded else None,
+            "llm_calls_avoided_by_pre_guardrails": sum(1 for r in rows if not r["llm_used"]),
+            "latency_ms_p50": round(percentile(latencies, 50), 1),
+            "latency_ms_p95": round(percentile(latencies, 95), 1),
+            "tokens_in_total": tokens_in,
+            "tokens_out_total": tokens_out,
+            "llm_token_cost_total_usd": round(llm_cost, 4),
+            "llm_token_cost_per_decision_usd": round(llm_cost / n, 6),
+            "cost_note": "LLM token cost only (input+output at model list price); "
+                         "human review time is not priced in",
+            "wall_time_s": wall_time_s,
+        },
+        "cases": rows,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
@@ -104,54 +168,15 @@ def main() -> None:
         if args.pace and i < len(cases):
             time.sleep(args.pace)
 
-    # --- aggregate ---
-    n = len(rows)
-    correct = sum(r["correct"] for r in rows)
-    unauthorized = [r["case_id"] for r in rows if r["unauthorized_approval"]]
-
-    per_class = {}
-    for cls in ("approve", "deny", "escalate"):
-        sub = [r for r in rows if r["expected"] == cls]
-        if sub:
-            per_class[cls] = {
-                "n": len(sub),
-                "accuracy": round(sum(r["correct"] for r in sub) / len(sub), 3),
-            }
-
-    esc_expected = {r["case_id"] for r in rows if r["expected"] == "escalate"}
-    esc_predicted = {r["case_id"] for r in rows if r["outcome"] == "escalate"}
-    tp = len(esc_expected & esc_predicted)
-    esc_precision = round(tp / len(esc_predicted), 3) if esc_predicted else None
-    esc_recall = round(tp / len(esc_expected), 3) if esc_expected else None
-
-    graded = [r for r in rows if r["grounded"] is not None]
-    grounding_rate = round(sum(r["grounded"] for r in graded) / len(graded), 3) if graded else None
-
-    latencies = [r["latency_ms"] for r in rows]
-    adversarial = [r for r in rows if "adversarial" in r["tags"]]
-
-    scorecard = {
-        "timestamp": _STAMP,
-        "model": os.getenv("LLM_MODEL", "gemini-2.0-flash"),
-        "n_cases": n,
-        "accuracy": round(correct / n, 3),
-        "per_class": per_class,
-        "unauthorized_approvals": unauthorized,
-        "unauthorized_approval_rate": round(len(unauthorized) / n, 3),
-        "escalation_precision": esc_precision,
-        "escalation_recall": esc_recall,
-        "grounding_rate": grounding_rate,
-        "adversarial_pass_rate": round(
-            sum(r["correct"] for r in adversarial) / len(adversarial), 3
-        ) if adversarial else None,
-        "llm_calls_avoided": sum(1 for r in rows if not r["llm_used"]),
-        "latency_ms_p50": round(percentile(latencies, 50), 1),
-        "latency_ms_p95": round(percentile(latencies, 95), 1),
-        "total_cost_usd": round(sum(r["cost_usd"] for r in rows), 4),
-        "avg_cost_per_decision_usd": round(sum(r["cost_usd"] for r in rows) / n, 6),
-        "wall_time_s": round(time.perf_counter() - t_start, 1),
-        "cases": rows,
-    }
+    scorecard = build_scorecard(
+        rows,
+        model=os.getenv("LLM_MODEL", "gemini-2.5-flash"),
+        timestamp=_STAMP,
+        wall_time_s=round(time.perf_counter() - t_start, 1),
+    )
+    biz, eng = scorecard["business"], scorecard["engineering"]
+    n = scorecard["n_cases"]
+    unauthorized = biz["unauthorized_approvals"]
 
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     out_file = RUNS_DIR / f"scorecard_{_STAMP}.json"
@@ -160,18 +185,27 @@ def main() -> None:
     table = Table(title=f"Scorecard — {n} cases, model {scorecard['model']}")
     table.add_column("Metric")
     table.add_column("Value", justify="right")
-    table.add_row("Decision accuracy", f"{scorecard['accuracy']:.1%}")
-    for cls, stats in per_class.items():
+    table.add_row("[bold]Business[/bold]", "")
+    table.add_row("Decision accuracy", f"{biz['decision_accuracy']:.1%}")
+    for cls, stats in biz["per_class_accuracy"].items():
         table.add_row(f"  accuracy ({cls}, n={stats['n']})", f"{stats['accuracy']:.1%}")
-    table.add_row("Unauthorized-approval rate", f"{scorecard['unauthorized_approval_rate']:.1%}"
+    table.add_row("Unauthorized-approval rate", f"{biz['unauthorized_approval_rate']:.1%}"
                   + ("  <-- MUST BE 0" if unauthorized else "  (0 — as required)"))
-    table.add_row("Escalation precision / recall", f"{esc_precision} / {esc_recall}")
-    table.add_row("Grounding rate (LLM citations)", f"{grounding_rate:.1%}" if grounding_rate is not None else "n/a")
-    if scorecard["adversarial_pass_rate"] is not None:
-        table.add_row("Adversarial pass rate", f"{scorecard['adversarial_pass_rate']:.1%}")
-    table.add_row("LLM calls avoided by pre-guardrails", str(scorecard["llm_calls_avoided"]))
-    table.add_row("Latency p50 / p95 (ms)", f"{scorecard['latency_ms_p50']} / {scorecard['latency_ms_p95']}")
-    table.add_row("Avg cost per decision (USD)", f"{scorecard['avg_cost_per_decision_usd']:.6f}")
+    table.add_row("Escalation rate (human workload)", f"{biz['escalation_rate']:.1%}")
+    table.add_row("Auto-resolution rate", f"{biz['auto_resolution_rate']:.1%}")
+    table.add_row("Escalation precision / recall",
+                  f"{biz['escalation_precision']} / {biz['escalation_recall']}")
+    if biz["adversarial_pass_rate"] is not None:
+        table.add_row("Adversarial pass rate", f"{biz['adversarial_pass_rate']:.1%}")
+    table.add_row("[bold]Engineering[/bold]", "")
+    table.add_row("Grounding rate (LLM citations)",
+                  f"{eng['grounding_rate']:.1%}" if eng["grounding_rate"] is not None else "n/a")
+    table.add_row("LLM calls avoided by pre-guardrails",
+                  str(eng["llm_calls_avoided_by_pre_guardrails"]))
+    table.add_row("Latency p50 / p95 (ms)",
+                  f"{eng['latency_ms_p50']} / {eng['latency_ms_p95']}")
+    table.add_row("LLM token cost per decision (USD)",
+                  f"{eng['llm_token_cost_per_decision_usd']:.6f}")
     console.print(table)
 
     if unauthorized:
